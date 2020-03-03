@@ -234,11 +234,40 @@ func TestBulkIndexer(t *testing.T) {
 			t.Fatalf("Unexpected error: %s", err)
 		}
 
+		// Demonstrate callback which sends to a channel
+		//
+		updatedIDs := make(chan string)
+		updateSuccessCallback := func(item BulkIndexerItem, res BulkIndexerResponseItem) {
+			if os.Getenv("DEBUG") != "" {
+				fmt.Println("updateSuccessCallback() -> ")
+			}
+			updatedIDs <- item.DocumentID
+		}
+
+		// Asynchronous channel consumer
+		//
+		var callbackWG sync.WaitGroup
+		callbackWG.Add(1)
+		go func() {
+			defer callbackWG.Done()
+			for {
+				select {
+				case <-updatedIDs:
+					if os.Getenv("DEBUG") != "" {
+						fmt.Println("<- updateSuccessCallback()...")
+					}
+					atomic.AddUint64(&countSuccessful, 1)
+					time.Sleep(100 * time.Millisecond) // Simulate slow operation
+					return
+				}
+			}
+		}()
+
 		if err := bi.Add(context.Background(), BulkIndexerItem{
 			Action:     "update",
 			DocumentID: "3",
 			Body:       strings.NewReader(`{"doc":{"title":"qux"}}`),
-			OnSuccess:  successFunc,
+			OnSuccess:  updateSuccessCallback,
 			OnFailure:  failureFunc,
 		}); err != nil {
 			t.Fatalf("Unexpected error: %s", err)
@@ -247,6 +276,8 @@ func TestBulkIndexer(t *testing.T) {
 		if err := bi.Close(context.Background()); err != nil {
 			t.Errorf("Unexpected error: %s", err)
 		}
+		close(updatedIDs)
+		callbackWG.Wait()
 
 		stats := bi.Stats()
 
@@ -275,12 +306,12 @@ func TestBulkIndexer(t *testing.T) {
 			t.Errorf("Unexpected NumUpdated: %d", stats.NumUpdated)
 		}
 
-		if countSuccessful != uint64(numItems-numFailed) {
-			t.Errorf("Unexpected countSuccessful: %d", countSuccessful)
+		if atomic.LoadUint64(&countSuccessful) != uint64(numItems-numFailed) {
+			t.Errorf("Unexpected countSuccessful: %d", atomic.LoadUint64(&countSuccessful))
 		}
 
-		if countFailed != uint64(numFailed) {
-			t.Errorf("Unexpected countFailed: %d", countFailed)
+		if atomic.LoadUint64(&countFailed) != uint64(numFailed) {
+			t.Errorf("Unexpected countFailed: %d", atomic.LoadUint64(&countFailed))
 		}
 
 		if !reflect.DeepEqual(failedIDs, []string{"1", "2"}) {
