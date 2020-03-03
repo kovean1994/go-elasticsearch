@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -18,12 +19,14 @@ import (
 )
 
 type Consumer struct {
-	BrokerURL  string
-	TopicName  string
-	IndexName  string
-	NumWorkers int
-	FlushBytes int
+	BrokerURL    string
+	TopicName    string
+	IndexName    string
+	NumConsumers int
+	NumWorkers   int
+	FlushBytes   int
 
+	wg      sync.WaitGroup
 	reader  *kafka.Reader
 	indexer esutil.BulkIndexer
 
@@ -62,34 +65,45 @@ func (c *Consumer) Run(ctx context.Context) (err error) {
 		ReadLagInterval: 500 * time.Millisecond,
 	})
 
-	for {
-		msg, err := c.reader.ReadMessage(context.Background())
-		if err != nil {
-			return fmt.Errorf("reader: %s", err)
-		}
-		// log.Printf("%v/%v/%v:%s\n", msg.Topic, msg.Partition, msg.Offset, string(msg.Value))
-
-		if err := c.indexer.Add(
-			context.Background(),
-			esutil.BulkIndexerItem{
-				Action: "index",
-				Body:   bytes.NewReader(msg.Value),
-				OnSuccess: func(item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem) {
-					// log.Printf("Indexed %s/%s", res.Index, res.DocumentID)
-				},
-				OnFailure: func(item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
-					if err != nil {
-						// log.Printf("ERROR: %s", err)
-					} else {
-						// log.Printf("ERROR: %s: %s", res.Error.Type, res.Error.Reason)
-					}
-				},
-			}); err != nil {
-			return fmt.Errorf("indexer: %s", err)
-		}
+	if c.NumConsumers < 1 {
+		c.NumConsumers = 1
 	}
 
-	c.reader.Close()
+	c.wg.Add(c.NumConsumers)
+	for i := 1; i <= c.NumConsumers; i++ {
+		go func() error {
+			defer c.wg.Done()
+			for {
+				msg, err := c.reader.ReadMessage(context.Background())
+				if err != nil {
+					return fmt.Errorf("reader: %s", err)
+				}
+				// log.Printf("%v/%v/%v:%s\n", msg.Topic, msg.Partition, msg.Offset, string(msg.Value))
+
+				if err := c.indexer.Add(
+					context.Background(),
+					esutil.BulkIndexerItem{
+						Action: "index",
+						Body:   bytes.NewReader(msg.Value),
+						OnSuccess: func(item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem) {
+							// log.Printf("Indexed %s/%s", res.Index, res.DocumentID)
+						},
+						OnFailure: func(item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
+							if err != nil {
+								// log.Printf("ERROR: %s", err)
+							} else {
+								// log.Printf("ERROR: %s: %s", res.Error.Type, res.Error.Reason)
+							}
+						},
+					}); err != nil {
+					return fmt.Errorf("indexer: %s", err)
+				}
+			}
+			return c.reader.Close()
+		}()
+	}
+	c.wg.Wait()
+
 	c.indexer.Close(context.Background())
 
 	return nil
